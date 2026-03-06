@@ -7,6 +7,7 @@ from scipy import linalg
 from scipy.special import erf 
 from pyscf import gto ,ao2mo, mcscf , lib , scf, cc 
 from pyscf.mp import ump2
+from dfrdump2_native import DFURDMP2
 from pyscf.dft.gen_grid import BLKSIZE, NBINS, CUTOFF, make_mask
 from pyscf.dft.numint import _dot_ao_ao_sparse,_scale_ao_sparse
 
@@ -205,16 +206,125 @@ def build_mbproj_2(ks):
   #print('LOOK HERE IS KS.QS[0] ',ks.QS[0])
   return
 
+def build_mbproj_spin(ks):
+  # Feb 2026, this builds a set of orthogonalized projected fragment 
+  # orbitals from a list of imput delocalized orbitals
+  # Input is ks.fragments [
+  # [definition of fragments as atom lists], 
+  # [number of paos in each fragment], 
+  # delocalized spinorbs used to build fragments
+  if(not (hasattr(ks,'fragments'))):
+    sys.exit('No fragments defined in ks for build_mbproj_spin')
+  m = ks.mol
+  nao = m.nao
+  fragats,fragnums,spinorbs=ks.fragments
+  nfrag =len(fragnums)
+  if(nfrag != len(fragats)):
+    sys.exit('nfrag %d and fragats %d in build_mbproj_spin'%(nfrag,len(fragats)))
+  nspinorb=spinorbs.shape[1] # AO, MO 
+  if(spinorbs.shape[0]!=nao): 
+    sys.exit('spinorbs nao %d and mol nao %d in build_mbproj_spin'%(spinorbs.shape[0],nao))
+  S = ks.get_ovlp() 
+
+  # Assign each AO to a fragment 
+  atom_of_ao = [0] * nao
+  iao = 0
+  for ishell in range(m.nbas):
+    l = m.bas_angular(ishell)
+    nc = m.bas_nctr(ishell)
+    if(m.cart):
+      nb = (l+1)*(l+2)/2*nc
+    else:
+      nb = (2*l+1)*nc
+    iat = m.bas_atom(ishell)
+    atom_of_ao[iao:iao+nb]=[iat]*nb
+    iao = iao+nb
+  fragment_of_ao = [-1]*nao
+  aos_in_frag = []
+  for ifrag in range(nfrag):
+    aos_in_frag.append([])
+  for iao in range(nao):
+     iat = atom_of_ao[iao]
+     for ifrag in range(nfrag):
+       if iat in fragats[ifrag]:
+         fragment_of_ao[iao] = ifrag 
+         aos_in_frag[ifrag].append(iao)
+
+  # Final loop over fragments 
+  thepaos = [] 
+  theVeepAOs= [] 
+  for ifrag in range(nfrag):
+    npao= fragnums[ifrag] # We'll generate npao paos for this fragment 
+
+    # Build a fragment molecule for building Vee
+    fraggeom =''
+    for iat2 in fragats[ifrag]:
+      xyz = m.atom_coords()[iat2]
+      fraggeom = fraggeom + '%4s %12.6f %12.6f %12.6f \n'%(m.atom_symbol(iat2),xyz[0],xyz[1],xyz[2])
+    mfrag = gto.Mole(atom=fraggeom,basis=m.basis,charge=0)
+    mfrag.unit=m.unit 
+    mfrag.cart=m.cart
+    if(mfrag.nelectron % 2 == 1):
+      mfrag.spin=1
+    mfrag.build() 
+    Sfrag= mfrag.intor_symmetric('int1e_ovlp')
+    print('Fragment %d contains atoms '%(ifrag))
+    print(fragats[ifrag])
+    print(' and %d aos %d projected orbs'%(mfrag.nao,npao))
+
+    # Find each spinorb's projection onto this fragment. 
+    # Save the projections and the renormalized spinorbitals 
+    spinnorms=[]
+    spinorbfrags=[]
+    print('Fragment ',ifrag,' S shape ',Sfrag.shape)
+    for ispin in range(nspinorb):
+      spinorbfrag = [spinorbs[iao,ispin] for iao in aos_in_frag[ifrag]]
+      spinorbfrag = numpy.array(spinorbfrag)
+      nsf = numpy.dot(spinorbfrag,numpy.dot(Sfrag,spinorbfrag))
+      spinnorms.append(nsf)
+      spinorbfrags.append(spinorbfrag*nsf**(-0.5))
+
+    print('Fragment ',ifrag,' spinorb projections \n',spinnorms)
+
+    # Select the spinorbs used to build phi for this fragment, in the fragment basis 
+    ssn = sorted(range(nspinorb),key=spinnorms.__getitem__,reverse=True)
+    thisfragorbs = []
+    for i in range(npao):
+      thisfragorbs.append(spinorbfrags[ssn[i]])
+      print('Fragment %d gets spinorb %d projection %.3f '%(ifrag,ssn[i],spinnorms[ssn[i]]))
+    thisfragorbs = numpy.array(thisfragorbs)
+    print('Fragment ',ifrag,' phi overlap, frag \n',numpy.einsum('im,mn,jn->ij',thisfragorbs,Sfrag,thisfragorbs))
+
+    # Generate Vee in fragment basis and phi in the full basis 
+    tfo2 = numpy.zeros((mfrag.nao,npao)) # AO, MO 
+    thisfragorbs2 = numpy.zeros((nao,npao)) # AO, MO
+    for ipao in range(npao):
+       tfo2[:,ipao]=thisfragorbs[ipao]
+       for i in range(len(aos_in_frag[ifrag])):
+          iao = aos_in_frag[ifrag][i]
+          thisfragorbs2[iao,ipao] = thisfragorbs[ipao,i]
+    print('Fragment ',ifrag,' phi overlap, full \n',numpy.einsum('mi,mn,nj->ij',thisfragorbs2,S,thisfragorbs2))
+    VeepAO2 = mfrag.ao2mo(mo_coeffs=tfo2)
+    VeepAO = ao2mo.restore(1,numpy.asarray(VeepAO2),tfo2.shape[1])
+    theVeepAOs.append(VeepAO)
+    thepaos.append(thisfragorbs2)
+
+  ks.paos = thepaos
+  ks.VeepAOs= theVeepAOs
+  ks.VeeRSpAOs= theVeepAOs 
+  pao_proj(ks) 
+  print('LOOK HERE IS KS.QS ',len(ks.QS),len(ks.SQ))
+  return
+
 def build_mbproj_fragment(ks):
-  # October 2025, this builds a set of orthogonalized projected fragment
-  # orbitals (opFOs) on each fragment, in an input AO basis, then builds
-  # projector Q from orthogonalizing all of those. The opFOs are saved in
-  # ks.proj for use in euci. Also saves VeepFOs from the fragment Vee for euci.
+  # October 2025, this builds a set of orthogonalized projected fragment 
+  # orbitals (opFOs) on each fragment, from the STO-3G minimal basis, then builds projector
+  # Q from orthogonalizing all of those. The opFOs are saved in ks.proj for use
+  # in euci. Also saves VeepFOs from the fragment Vee for euci.
   # 
-  # Input is ks.fragments, a tuple of [ 0-start start atom in the
-  # fragment,[projected fragment orbs for the fragment],fragment AO basis ].
-  # The atom lists must be contiguous and the projected fragment orbs must have
-  # the same atom ordering as the atom list
+  # Input is ks.fragments, a tuple of [ 0-start start atom in the fragment,[projected
+  # fragment orbs for the fragment]]. The atom lists must be contiguous and the
+  # projected fragment orbs must have the same atom ordering as the atom list
   if(not (hasattr(ks,'fragments'))):
     sys.exit('No fragments defined in ks for build_mbproj_fragment')
   fragstarts,fragorbs,fragbasis =ks.fragments
@@ -223,7 +333,7 @@ def build_mbproj_fragment(ks):
   nfrag = len(fragstarts)
   print('Fragment basis ',fragbasis)
   print('Fragment starts ',fragstarts)
-  print('Fragment orbs ',fragorbs)
+  #print('Fragment orbs ',fragorbs)
   
   S = ks.get_ovlp() 
   Sm = numpy.linalg.inv(S)
@@ -238,10 +348,11 @@ def build_mbproj_fragment(ks):
   # Full molecule in fragment basis 
   mmin =gto.Mole(atom=m.atom,basis=fragbasis,charge=m.charge,spin=m.spin)
   mmin.unit=m.unit
+  mmin.cart=m.cart
   mmin.build()
   SX = gto.intor_cross('int1e_ovlp',m,mmin)
 
-  # Fragment molecules in minimal basis and fragment indexing 
+  # Fragment molecules in fragment basis and fragment indexing 
   iaostart = 0
   for iat in range(nfrag):
     atstart=fragstarts[iat]
@@ -249,17 +360,19 @@ def build_mbproj_fragment(ks):
     if(iat<nfrag-1):
       atend = fragstarts[iat+1]
     thisfragorbs = fragorbs[iat]
-    npao = len(thisfragorbs)
-    print('Fragment %d contains atoms %d-%d and %d projected orbs'%(iat,atstart,atend,npao))
+    #print('Look here is the shape of fragment ',iat,' orbitals ',thisfragorbs.shape)
+    npao = thisfragorbs.shape[0] # len(thisfragorbs)
 
     fraggeom =''
-    for iat in range(atstart,atend):
-      xyz = m.atom_coords()[iat]
-      fraggeom = fraggeom + '%4s %12.6f %12.6f %12.6f \n'%(m.atom_symbol(iat),xyz[0],xyz[1],xyz[2])
+    for iat2 in range(atstart,atend):
+      xyz = m.atom_coords()[iat2]
+      fraggeom = fraggeom + '%4s %12.6f %12.6f %12.6f \n'%(m.atom_symbol(iat2),xyz[0],xyz[1],xyz[2])
     mfrag = gto.Mole(atom=fraggeom,basis=fragbasis,charge=0)
+    mfrag.cart=m.cart
     if(mfrag.nelectron % 2 == 1):
       mfrag.spin=1
     mfrag.build() 
+    print('Fragment %d contains atoms %d-%d and %d aos %d projected orbs'%(iat,atstart,atend,mfrag.nao,npao))
 
     tfo2 = numpy.zeros((mfrag.nao,npao)) # spin, AO, MO 
     for ipao in range(npao):
@@ -268,17 +381,18 @@ def build_mbproj_fragment(ks):
 
     Sfrag= mfrag.intor_symmetric('int1e_ovlp')
 
-#    eri0=mfrag.intor('int2e').reshape(mfrag.nao,mfrag.nao,mfrag.nao,mfrag.nao)
-#    mfrag.set_range_coulomb(omega) # Range separation 
-#    eri1=mfrag.intor('int2e').reshape(mfrag.nao,mfrag.nao,mfrag.nao,mfrag.nao)
-#    t1 = numpy.einsum('mnpq,lq->mnpl',eri0,thisfragorbs)
-#    t2 = numpy.einsum('mnpl,kp->mnkl',t1,thisfragorbs)
-#    t1 = numpy.einsum('mnkl,jn->mjkl',t2,thisfragorbs)
-#    VeepAO= numpy.einsum('mjkl,im->ijkl',t1,thisfragorbs)
-#    t1 = numpy.einsum('mnpq,lq->mnpl',eri1,thisfragorbs)
-#    t2 = numpy.einsum('mnpl,kp->mnkl',t1,thisfragorbs)
-#    t1 = numpy.einsum('mnkl,jn->mjkl',t2,thisfragorbs)
-#    VeeRSpAO= numpy.einsum('mjkl,im->ijkl',t1,thisfragorbs)
+    #eri0=mfrag.intor('int2e').reshape(mfrag.nao,mfrag.nao,mfrag.nao,mfrag.nao)
+    #mfrag.set_range_coulomb(omega) # Range separation 
+    #eri1=mfrag.intor('int2e').reshape(mfrag.nao,mfrag.nao,mfrag.nao,mfrag.nao)
+    #t1 = numpy.einsum('mnpq,lq->mnpl',eri0,thisfragorbs)
+    #t2 = numpy.einsum('mnpl,kp->mnkl',t1,thisfragorbs)
+    #t1 = numpy.einsum('mnkl,jn->mjkl',t2,thisfragorbs)
+    #VeepAO= numpy.einsum('mjkl,im->ijkl',t1,thisfragorbs)
+    #t1 = numpy.einsum('mnpq,lq->mnpl',eri1,thisfragorbs)
+    #t2 = numpy.einsum('mnpl,kp->mnkl',t1,thisfragorbs)
+    #t1 = numpy.einsum('mnkl,jn->mjkl',t2,thisfragorbs)
+    #VeeRSpAO= numpy.einsum('mjkl,im->ijkl',t1,thisfragorbs)
+    print('LOOK WE HAVE MO COEFFS SHAPE ',tfo2.shape)
     VeepAO2 = mfrag.ao2mo(mo_coeffs=tfo2)
     VeepAO = ao2mo.restore(1,numpy.asarray(VeepAO2),tfo2.shape[1])
     print('VEES SHAPE ',VeepAO.shape)
@@ -286,7 +400,6 @@ def build_mbproj_fragment(ks):
     mfrag.set_range_coulomb(omega) # Range separation 
     VeeRSpAO2 = mfrag.ao2mo(mo_coeffs=tfo2)
     VeeRSpAO= ao2mo.restore(1,numpy.asarray(VeeRSpAO2),tfo2.shape[1])
-
     theVeepAOs.append(VeepAO)
     theVeeRSpAOs.append(VeeRSpAO)
 
@@ -638,6 +751,9 @@ def build_proj(ks):
         if('FragAOs' in ks.paos):
           build_mbproj_fragment(ks)
           return 
+        if('SpinAOs' in ks.paos):
+          build_mbproj_spin(ks)
+          return
         if('NewDZVAOs' in ks.paos):
           build_mbproj_3(ks)
           return 
@@ -827,7 +943,7 @@ def O2_1to2(O1,S12,Sm1):
   return(O2)
 
 
-def eci(ks,QS=None,QMOs=None,Pin=None,hl=0,emos=None):
+def eci(ks,QS=None,QMOs=None,Pin=None,hl=0):
   # Generate the projected CI correlation energy with Vee projection Q,
   # defaulting to that in ks. October 2025, accept four projections QMO to
   # choose the occa,virta,occb,virtb MOs entering the CI. November 2025, try to
@@ -839,8 +955,6 @@ def eci(ks,QS=None,QMOs=None,Pin=None,hl=0,emos=None):
   m = ks.mol
   nao = m.nao
   omega, alpha, hyb = ks._numint.rsh_and_hybrid_coeff(ks.xc, spin=m.spin)
-  if(emos is None):
-    emos = ks.mo_energy
   if(Pin is None):
     P = ks.make_rdm1() 
   else:
@@ -853,12 +967,6 @@ def eci(ks,QS=None,QMOs=None,Pin=None,hl=0,emos=None):
   SQ = numpy.dot(S,Q)
   QSQ = numpy.dot(QS,Q)
   print('eci qsqtest ',numpy.einsum('ij->',QSQ-Q))
-  SQSMOs = []
-  for ttype in range(4): 
-    Qm = QMOs[ttype]
-    QSQm = numpy.dot(Qm,numpy.dot(S,Qm))
-    print('eci qmosqtest',numpy.einsum('ij->',QSQm-Qm))
-
   SQSMOs = []
   for ttype in range(4):
     SQSMO = numpy.dot(S,numpy.dot(QMOs[ttype],S))
@@ -907,18 +1015,10 @@ def eci(ks,QS=None,QMOs=None,Pin=None,hl=0,emos=None):
     Jp= numpy.einsum('ik,kj->ij',SQ,numpy.einsum('ik,kj->ij',Jp0,QS))
     Kp= numpy.einsum('ik,skj->sij',SQ,numpy.einsum('sik,kj->sij',Kp0,QS))
     VXCp= numpy.einsum('ik,skj->sij',SQ,numpy.einsum('sik,kj->sij',VXCp0,QS))
-    #Jp = Jp0
-    #Kp = Kp0
-    #VXCp = VXCp0
-    #print('Full J\n',J,'\nProj J\n',Jp)
-    #print('Full VXC\n',VXC,'\nProj VXC\n',VXCp)
 
     # Terms 'inside' and 'outside' the projected region 
     Jout   = J-Jp 
     VXCout = (VXC-VXCp) + hyb*(K-Kp) 
-    #print('J, Jp0, Jp, Jout \n',J,'\n\n',Jp0,'\n\n',Jp,'\n\n',Jout)
-    #print('K and Kout\n',(VXC+hyb*K)[0],'\n',VXCout[0])
-    #print('Test ECoul from Pfull and J,Jp ',numpy.einsum('sij,ij->',P,J),numpy.einsum('sij,ij->',P,Jp))
 
     # Mean-field effective Hamiltonian, 'outside' and 'inside' 
     # NOTE this assumes 100% projected Vee 'inside' reference system 
@@ -940,9 +1040,6 @@ def eci(ks,QS=None,QMOs=None,Pin=None,hl=0,emos=None):
     vhxcin[1] = Jp + Kp[1] 
     print('ECI Self energy EHp, <h1out>, <vhxcin> ',EHp,numpy.einsum('sij,sij->',P,h1aoout),numpy.einsum('sij,sij->',P,vhxcin)) 
 
-    # TEST 
-    #print('Focka\n',h0+J+K[0],'\n',ks.get_fock()[0],'\n',h1aoout[0],'\n',vhxcin[0])
-   
     # Projected energy
     Eproj0 = numpy.einsum('sij,ij->',P,h0) + Enuc 
     Eproj1 = Eproj0 + EH + EXp   + (EXC - EXCp) + hyb*(EX-EXp) -EEref 
@@ -969,7 +1066,7 @@ def eci(ks,QS=None,QMOs=None,Pin=None,hl=0,emos=None):
   # Transform the MOs, so that we can only do CI with transformed MOs that have
   # non-negligible projection onto Q (or QMO).  Transform occ alpha, virt alpha, occ
   # beta, virt beta blocks separately
-  thresh=0.00001
+  thresh=0.01
   ncas = 0 
   nelecas = 0 
   froz_a=[]
@@ -984,11 +1081,6 @@ def eci(ks,QS=None,QMOs=None,Pin=None,hl=0,emos=None):
     if(ttype == 2): mo = mo_b[:,:Nb]
     if(ttype == 3): mo = mo_b[:,Nb:]
     if(mo.shape[1]>0):
-      #B = numpy.einsum('mi,mn,nj->ij',mo,SQS,mo) 
-      # Recheck August 2025. Something's not right 
-      # Q = [sum m]|m><m| 
-      # B(i,j) = [sum m] <psi_i|m><m|psi_j> 
-      #B = numpy.einsum('mi,mn,nj->ij',mo,SQS,mo) 
       B = numpy.einsum('mi,mn,nj->ij',mo,SQSMOs[ttype],mo) 
       val,vec= linalg.eigh(B)
       print(' ttype ',ttype,' eigenvals \n',val)
@@ -1053,7 +1145,7 @@ def eci(ks,QS=None,QMOs=None,Pin=None,hl=0,emos=None):
 
   print('Doing CI with hl ',hl,' nao ',nao,' nelec ',Na+Nb,' ncas ',ncas,' nelecas ',nelecas)
   if(nelecas[0]+nelecas[1]<2):
-    return(0,0,0) 
+    return(0,0) 
   print('Transformed MO shape ',tmo_a.shape)
   #print('Active transformed MO shape ',atmo_a.shape,atmo_b.shape)
   
@@ -1087,43 +1179,98 @@ def eci(ks,QS=None,QMOs=None,Pin=None,hl=0,emos=None):
 
   # Project regular MOs (not transformed MOs defining the CI space) onto Q and
   # generate projected MP2 correlation from HF state 
-  pMO = numpy.zeros((2,nao,nao))
+  nmo = mo_a.shape[1]
+  pMO = numpy.zeros((2,nao,nmo))
   pMO[0] = numpy.dot(QS,mo_a) # (ao,mo) 
   pMO[1] = numpy.dot(QS,mo_b)
-  #h2fullmo = mc.get_h2eff(pMO)
-  ks.addMP2 = 0 
-  ks.lhlam= 0 
-  tehmp2 = ump2.UMP2(ks)
-  teheris = tehmp2.ao2mo(mo_coeff=pMO)
-  tehmp2.mo_energy = emos 
-  print('ECI Doing projected mp2 with mo energies\n',emos)
-  # Looks like the problem is that UMP2 kernel runs a get_e_hf routine that completly
-  # recomputes the mo energies. 
-  #EMP2 = tehmp2.kernel(mo_energy=emos, mo_coeff=ks.mo_coeff,eris=teheris)[0]
-  EMP2 = tehmp2.init_amps(mo_energy=emos, mo_coeff=ks.mo_coeff,eris=teheris,with_t2=False)[0]
-  
+  mykmp =DFURDMP2(ks,tau=ks.mp2lam,auxbasis='cc-pvtz-ri')
+  #teheris = mykmp.ao2mo(mo_coeff=pMO)
+  #EMP2 = mykmp.init_amps(mo_energy=ks.mo_energy, mo_coeff=ks.mo_coeff,eris=teheris)[0]
+  mykmp.mo_coeff=pMO
+  EMP2 = mykmp.calculate_energy()
 
-  # Do SVD CI with only the first few degrees of freedom
-  Ecorr2 = 0 
-#  fcivec2 = fcivec.flatten()
-#  print('FCI vec normalization : ',numpy.dot(fcivec2,fcivec2))
-#  u,ss,vh = linalg.svd(fcivec)
-#  print('FCI singular values: ')
-#  for sval in ss:
-#    print(sval)
-#  nn = ss.shape[0]
-#  ss2 = numpy.zeros((nn,nn))
-#  for i in range(2):
-#    ss2[i,i] = ss[i]
-#  fcivec3 = numpy.dot(u,numpy.dot(ss2,vh))
-#  print('shapes ',fcivec.shape,fcivec3.shape,u.shape,ss.shape,vh.shape)
-#  eci2 = mc.fcisolver.energy(h1mo,h2mo,fcivec3,mc.ncas,mc.nelecas)
-#  print('FCI vector and HF energies of reference (not real) system',eci,eci2,ehf)
-#  Ecorr2 = eci2 - ehf 
+  print('ECI CASCI and MP2 Ecorr ',Ecorr,EMP2)
+  return(Ecorr,EMP2) 
 
+def get_ehxc(ks,P,xc):
+  # This function generates the Hartree-exchange-correlation energy for a
+  # global hybrid.
+  #
+  # Returns Hartree plus one-electron energy Eother, exact
+  # exchange, DFT exchange, DFT correlation, and total EXC 
+  m = ks.mol
+  nao = m.nao
+  omega, alpha, hyb = ks._numint.rsh_and_hybrid_coeff(ks.xc, spin=m.spin)
+  if(len(P.shape)<3): # Convert RHF to UHF 
+    print('Converting RHF to UHF') 
+    Ptemp=P
+    P=numpy.zeros((2,nao,nao))
+    P[0]=Ptemp/2
+    P[1]=Ptemp/2
+  (Na,Nb)=m.nelec
+  (Pa,Pb)=P
 
-  print('ECI CASCI and MP2 Ecorr ',Ecorr,Ecorr2,EMP2)
-  return(Ecorr,Ecorr2,EMP2) 
+  h0=ks.get_hcore()
+  Jmat2 = ks.get_j(dm=P)
+  Jmat = Jmat2[0] + Jmat2[1] 
+  Eother = numpy.einsum('sij,ij->',P,h0) + numpy.einsum('sij,ji->',P,Jmat)/2. +m.get_enuc()
+  K=ks.get_k(dm=P)
+  EX=-0.5*numpy.einsum('sij,sij->',P,K)
+
+  x=xc
+  x=(x.split(','))[0] + ','
+
+  EXSL=0
+  ECSL=0
+  NA=0
+  hermi=1 
+  tiny = 0.00000001
+  ni = ks._numint
+  ao_deriv=0
+  xctype=ni._xc_type(xc)
+  if xctype == 'GGA':
+    ao_deriv=1
+  elif xctype == 'MGGA':
+    ao_deriv=1
+  if(not(xc=='HF,' or xc=='hf,')):
+    # Do the numerical integrals 
+    make_rhoa, nset = ni._gen_rho_evaluator(m, [P[0]], hermi, False, ks.grids)[:2]
+    make_rhob       = ni._gen_rho_evaluator(m, [P[1]], hermi, False, ks.grids)[0]
+    for aos, mask, weight, coords in ni.block_loop(m, ks.grids, nao, ao_deriv, max_memory=2000):
+
+      # Densities needed 
+      rho_a = make_rhoa(0, aos, mask, xctype)
+      rho_b = make_rhob(0, aos, mask, xctype)
+      if(len(rho_b.shape)>1):
+        rho_b[0,rho_b[0]<tiny]=tiny
+        rhob = rho_b[0]
+      else:
+        rho_b[rho_b<tiny]=tiny
+        rhob = rho_b
+      if(len(rho_a.shape)>1):
+        rho_a[0,rho_a[0]<tiny]=tiny
+        rhoa = rho_a[0]
+      else:
+        rho_a[rho_a<tiny]=tiny
+        rhoa = rho_a
+      rho = (rho_a, rho_b)
+
+      # Semilocal exchange and correlation 
+      exc = ni.eval_xc_eff(xc, rho, deriv=0, xctype=xctype)[0]
+      exc = exc*(rhoa+rhob) 
+      ex = numpy.zeros_like(exc)
+      if(not(x=='HF,' or x=='hf,')):
+        ex = ni.eval_xc_eff(x, rho, deriv=0, xctype=xctype)[0]
+        ex = ex*(rhoa+rhob) 
+      ec = exc - ex 
+
+      # Sum terms 
+      EXSL = EXSL + numpy.dot(ex,weight)
+      ECSL = ECSL + numpy.dot(ec,weight)
+      NA = NA + numpy.dot(rhoa,weight)
+  print('GET_EHXC TEST: ',Na,NA)
+  EXC = hyb*EX +EXSL +ECSL
+  return(Eother,EX,EXSL,ECSL,EXC)
 
 
 def epzlh(ks,P,allc=0):
@@ -1386,8 +1533,8 @@ def new_epzlh(ks,P,lhexp=20):
       rhp = (rhp_a, rhp_b)
 
       # Exact exchange 
-      #aos = m.eval_gto("GTOval_sph",coords)
-      aos = m.eval_gto("GTOval_cart",coords)
+      aos = m.eval_gto("GTOval_sph",coords)
+      #aos = m.eval_gto("GTOval_cart",coords)
       print('TEST shapes ',m.nao,aos.shape,Pa.shape)
       rhoa= numpy.einsum('ri,ij,rj->r',aos,Pa,aos)
       rhob= numpy.einsum('ri,ij,rj->r',aos,Pb,aos)
@@ -1415,7 +1562,7 @@ def new_epzlh(ks,P,lhexp=20):
 
       # No XC where projected exact exchange is near total exact exchange. 
       fac = expr/ex
-      fac[fac>1]=1
+      # March 2026 this could be physically >1 where |<Veeproj>| > |<Veefull>|  fac[fac>1]=1
       fac[fac<0]=0
 
       # Local hybrid weights: No SL XC where fac is near 0
@@ -1458,9 +1605,12 @@ def new_epzlh(ks,P,lhexp=20):
       ECPLH = ECPLH + numpy.dot(epclh,weight) 
       NA = NA + numpy.dot(rhoa+rhob,weight)
       NPA= NPA+ numpy.dot((rhoa+rhob)*fac,weight)
+  # For global hybrids the semilocal exchange is already scaled by (1-hyb)
   if(hyb is not None):
-     if(hyb>0.000001):
-       EXSL = EXSL/(1-hyb) # exsl is already scaled by (1-hyb), this is a global hybrid 
+     if(hyb>0.000001 and hyb<1):
+       EXSL = EXSL/(1-hyb) 
+       EXPSL = EXPSL/(1-hyb) 
+       EXPLH = EXPLH/(1-hyb) 
   print('EPZLH Ntot,Nact',NA,NPA)
   print('EPZLH TEST: ',Eother,EX,EX2,EXP,EXP2,NA,NPA)
   print('EPZSL ESL: ',EXSL,ECSL,EXPSL,ECPSL)
@@ -1673,10 +1823,11 @@ def euci3(ks,xc,Pin=None,addX=True,addMP2=True,stype=1):
   # Pin is the input 1PDM
   # addX=True adds exact exchange and subtracts off semilocal XC for each oPAO 
   # addMP2=True subtracts off MP2 correlation 
-  # stype is a switch for semilocal XC 
+  # stype is a switch for projected semilocal XC 
   #  stype=1: Traditional DFT+U, -J/2*(noa + nob) 
   #  stype=2: Pass projected 1PDM to standard DFT integration 
   #  stype=3: Reweight exc[rho] with puks
+  #  stype=4: Reweight exc[rho] with puks
 
   # Set up 
   pAOs = ks.paos 
@@ -1684,6 +1835,7 @@ def euci3(ks,xc,Pin=None,addX=True,addMP2=True,stype=1):
   (Na,Nb)=m.nelec
   nao = m.nao
   ni = ks._numint
+  phyb = ks.phyb
   omega, alpha, hyb = ks._numint.rsh_and_hybrid_coeff(ks.xc, spin=m.spin)
   print('EUCI3 OMEGA ALPHA HYB ',omega,alpha,hyb)
   if(Pin is None):
@@ -1756,15 +1908,15 @@ def euci3(ks,xc,Pin=None,addX=True,addMP2=True,stype=1):
   #PvE[1] = numpy.dot(temp,numpy.transpose(mo_b[:,Nb:Nb+1]))
 
   print('Occ and virt traces: ',numpy.einsum('sij,ij->s',P,S),numpy.einsum('sij,ij->s',Pv,S))
-  print('Occ energies:\n',e_a[:Na],e_b[:Nb])
-  print('Virt energies:\n',e_a[Na:],e_b[Nb:])
+  #print('Occ energies:\n',e_a[:Na],e_b[:Nb])
+  #print('Virt energies:\n',e_a[Na:],e_b[Nb:])
 
   # Renormalized virtal DM for renormalized perturbation theory 
   eap = numpy.copy(e_a[Na:])
   ebp = numpy.copy(e_b[Nb:])
   mp2lam = ks.mp2lam
   if(mp2lam is None):
-    mp2lam = 0.0000001
+    mp2lam = 2.39 
   for i in range(len(eap)):
     if(eap[i]-e_a[Na-1] <mp2lam):
       eap[i] = e_a[Na-1]+mp2lam
@@ -1885,7 +2037,7 @@ def euci3(ks,xc,Pin=None,addX=True,addMP2=True,stype=1):
              VS[0]=VS[0] + numpy.dot(SQ,numpy.dot(vxcp0[0],QS))
              VS[1]=VS[1] + numpy.dot(SQ,numpy.dot(vxcp0[1],QS))
              print('De-Projected Test: ',noa,nob,numpy.einsum('sij,ij->s',Pss,S),np)
-           elif(stype==3): # Save Pss to weight the full-P XC functional
+           elif(stype>=3): # Save Pss to weight the full-P XC functional
              Qs.append(Q)
              Js.append(J)
              SQs.append(SQ)
@@ -1975,7 +2127,8 @@ def euci3(ks,xc,Pin=None,addX=True,addMP2=True,stype=1):
    VXC = VXC + VX - VS 
   #print('RETURNING VXC ',VXC.shape,'\n',VXC)
 
-  return(EXC,VXC)
+  #return(EXC,VXC,EX,EC,ECP,ES)
+  return(EXC,VXC,EX,EC,ECP,ES)
 
 def euci2(ks,Pin=None,lam=1):
   # Generate the pDFT+UCI correlation energy 
@@ -2164,190 +2317,193 @@ def euci2(ks,Pin=None,lam=1):
   omega, alpha, hyb = ks._numint.rsh_and_hybrid_coeff(ks.xc, spin=m.spin)
   print('TEH XC ',xc,hyb)
 
-  ni = ks._numint
-  ao_deriv=0
-  xctype=ni._xc_type(xc)
-  if xctype == 'GGA':
-    ao_deriv=1
-  elif xctype == 'MGGA':
-    ao_deriv=1
-  nao=m.nao
-  tiny = 0.00000001
-  make_rhoa, nset = ni._gen_rho_evaluator(m, [P[0]], hermi, False, ks.grids)[:2]
-  make_rhob       = ni._gen_rho_evaluator(m, [P[1]], hermi, False, ks.grids)[0]
-  make_rhpspa, nset = ni._gen_rho_evaluator(m, [PSP[0]], hermi, False, ks.grids)[:2]
-  make_rhpspb       = ni._gen_rho_evaluator(m, [PSP[1]], hermi, False, ks.grids)[0]
-  make_rhpas=[]
-  make_rhpbs=[]
-  for PP in PPs:
-    make_rhpa, nset = ni._gen_rho_evaluator(m, [PP[0]], hermi, False, ks.grids)[:2]
-    make_rhpb       = ni._gen_rho_evaluator(m, [PP[1]], hermi, False, ks.grids)[0]
-    make_rhpas.append(make_rhpa)
-    make_rhpbs.append(make_rhpb)
-  make_rhppsppas=[]
-  make_rhppsppbs=[]
-  for PpSPp in PpSPps:
-    make_rhppsppa, nset = ni._gen_rho_evaluator(m, [PpSPp[0]], hermi, False, ks.grids)[:2]
-    make_rhppsppb       = ni._gen_rho_evaluator(m, [PpSPp[1]], hermi, False, ks.grids)[0]
-    make_rhppsppas.append(make_rhppsppa)
-    make_rhppsppbs.append(make_rhppsppb)
+  if(not(xc=='HF,' or xc=='hf,')):
+    ni = ks._numint
+    ao_deriv=0
+    xctype=ni._xc_type(xc)
+    if xctype == 'GGA':
+      ao_deriv=1
+    elif xctype == 'MGGA':
+      ao_deriv=1
+    nao=m.nao
+    tiny = 0.00000001
+    make_rhoa, nset = ni._gen_rho_evaluator(m, [P[0]], hermi, False, ks.grids)[:2]
+    make_rhob       = ni._gen_rho_evaluator(m, [P[1]], hermi, False, ks.grids)[0]
+    make_rhpspa, nset = ni._gen_rho_evaluator(m, [PSP[0]], hermi, False, ks.grids)[:2]
+    make_rhpspb       = ni._gen_rho_evaluator(m, [PSP[1]], hermi, False, ks.grids)[0]
+    make_rhpas=[]
+    make_rhpbs=[]
+    for PP in PPs:
+      make_rhpa, nset = ni._gen_rho_evaluator(m, [PP[0]], hermi, False, ks.grids)[:2]
+      make_rhpb       = ni._gen_rho_evaluator(m, [PP[1]], hermi, False, ks.grids)[0]
+      make_rhpas.append(make_rhpa)
+      make_rhpbs.append(make_rhpb)
+    make_rhppsppas=[]
+    make_rhppsppbs=[]
+    for PpSPp in PpSPps:
+      make_rhppsppa, nset = ni._gen_rho_evaluator(m, [PpSPp[0]], hermi, False, ks.grids)[:2]
+      make_rhppsppb       = ni._gen_rho_evaluator(m, [PpSPp[1]], hermi, False, ks.grids)[0]
+      make_rhppsppas.append(make_rhppsppa)
+      make_rhppsppbs.append(make_rhppsppb)
 
-  # Use gen_rho_evaluator to compute exact exchange energy densities 
-  exctype = 'LDA' 
-  make_exfa = ni._gen_rho_evaluator(m, [R[0]], hermi, False, ks.grids)[0]
-  make_exfb = ni._gen_rho_evaluator(m, [R[1]], hermi, False, ks.grids)[0]
-  make_expfa = ni._gen_rho_evaluator(m, [RF[0]], hermi, False, ks.grids)[0]
-  make_expfb = ni._gen_rho_evaluator(m, [RF[1]], hermi, False, ks.grids)[0]
-  make_expas=[]
-  make_expbs=[]
-  for RP in RPs:
-    make_expa = ni._gen_rho_evaluator(m, [RP[0]], hermi, False, ks.grids)[0]
-    make_expb = ni._gen_rho_evaluator(m, [RP[1]], hermi, False, ks.grids)[0]
-    make_expas.append(make_expa)
-    make_expbs.append(make_expb)
+    # Use gen_rho_evaluator to compute exact exchange energy densities 
+    exctype = 'LDA' 
+    make_exfa = ni._gen_rho_evaluator(m, [R[0]], hermi, False, ks.grids)[0]
+    make_exfb = ni._gen_rho_evaluator(m, [R[1]], hermi, False, ks.grids)[0]
+    make_expfa = ni._gen_rho_evaluator(m, [RF[0]], hermi, False, ks.grids)[0]
+    make_expfb = ni._gen_rho_evaluator(m, [RF[1]], hermi, False, ks.grids)[0]
+    make_expas=[]
+    make_expbs=[]
+    for RP in RPs:
+      make_expa = ni._gen_rho_evaluator(m, [RP[0]], hermi, False, ks.grids)[0]
+      make_expb = ni._gen_rho_evaluator(m, [RP[1]], hermi, False, ks.grids)[0]
+      make_expas.append(make_expa)
+      make_expbs.append(make_expb)
 
-  for aos, mask, weight, coords in ni.block_loop(m, ks.grids, nao, ao_deriv, max_memory=2000):
+    for aos, mask, weight, coords in ni.block_loop(m, ks.grids, nao, ao_deriv, max_memory=2000):
 
-      aosex=aos[0]
-      if(ao_deriv<1):
-        aosex = aos[0]
-      print('!!!',aos.shape)
+        aosex=aos[0]
+        if(ao_deriv<1):
+          aosex = aos[0]
+        print('!!!',aos.shape)
 
-      # Density 
-      rho_a = make_rhoa(0, aos, mask, xctype)
-      rho_b = make_rhob(0, aos, mask, xctype)
-      if(len(rho_b.shape)>1):
-        rho_b[0,rho_b[0]<tiny]=tiny
-        rhob = rho_b[0]
-      else:
-        rho_b[rho_b<tiny]=tiny
-        rhob = rho_b
-      if(len(rho_a.shape)>1):
-        rho_a[0,rho_a[0]<tiny]=tiny
-        rhoa = rho_a[0]
-      else:
-        rho_a[rho_a<tiny]=tiny
-        rhoa = rho_a
-      rhpsp_a = make_rhpspa(0, aos, mask, xctype)
-      rhpsp_b = make_rhpspb(0, aos, mask, xctype)
-      if(len(rhpsp_b.shape)>1):
-        rhpsp_b[0,rhpsp_b[0]<tiny]=tiny
-        rhpspb = rhpsp_b[0]
-      else:
-        rhpsp_b[rhpsp_b<tiny]=tiny
-        rhpspb = rhpsp_b
-      if(len(rhpsp_a.shape)>1):
-        rhpsp_a[0,rhpsp_a[0]<tiny]=tiny
-        rhpspa = rhpsp_a[0]
-      else:
-        rhpsp_a[rhpsp_a<tiny]=tiny
-        rhpspa = rhpsp_a
-
-      NA = NA+numpy.dot(rhoa,weight)
-      NB = NB+numpy.dot(rhob,weight)
-      rho = (rho_a, rho_b)
-
-      # LH terms 
-      #aos2 = m.eval_gto("GTOval_sph",coords)
-      #exfull=numpy.einsum('ri,sij,rj->r',aos2,R,aos2)
-      #expf=numpy.einsum('ri,sij,rj->r',aos2,RF,aos2)
-      exfull=make_exfa(0, aosex, mask, exctype)+make_exfb(0,aosex,mask,exctype)
-      expf=make_expfa(0, aosex, mask, exctype)+make_expfb(0,aosex,mask,exctype)
-      #print('!!!',exfull.shape)
-      exfull[exfull<tiny]=tiny
-      exfull=-0.5*exfull
-      expf[expf<tiny]=tiny
-      expf=-0.5*expf
-
-      # SL XC 
-      x=xc
-      x=(x.split(','))[0] + ','
-      excsl=numpy.zeros_like(rhoa)
-      exsl=numpy.zeros_like(rhoa)
-      ecsl=numpy.zeros_like(rhoa)
-      if(xc!='hf'):
-        excsl, vxc = ni.eval_xc_eff(xc, rho, deriv=1, xctype=xctype)[:2]
-        if(x=='lda,' or x=='LDA,'):
-          exsl = ni.eval_xc_eff(x, (rhoa,rhob), deriv=0, xctype=xctype)[0]
+        # Density 
+        rho_a = make_rhoa(0, aos, mask, xctype)
+        rho_b = make_rhob(0, aos, mask, xctype)
+        if(len(rho_b.shape)>1):
+          rho_b[0,rho_b[0]<tiny]=tiny
+          rhob = rho_b[0]
         else:
-          exsl, vxc = ni.eval_xc_eff(x, rho, deriv=1, xctype=xctype)[:2]
-        excsl = excsl*(rhoa+rhob) 
-        exsl = exsl*(rhoa+rhob) 
-        ecsl=excsl-exsl
-      print('??',numpy.dot(weight,excsl),numpy.dot(weight,exsl))
+          rho_b[rho_b<tiny]=tiny
+          rhob = rho_b
+        if(len(rho_a.shape)>1):
+          rho_a[0,rho_a[0]<tiny]=tiny
+          rhoa = rho_a[0]
+        else:
+          rho_a[rho_a<tiny]=tiny
+          rhoa = rho_a
+        rhpsp_a = make_rhpspa(0, aos, mask, xctype)
+        rhpsp_b = make_rhpspb(0, aos, mask, xctype)
+        if(len(rhpsp_b.shape)>1):
+          rhpsp_b[0,rhpsp_b[0]<tiny]=tiny
+          rhpspb = rhpsp_b[0]
+        else:
+          rhpsp_b[rhpsp_b<tiny]=tiny
+          rhpspb = rhpsp_b
+        if(len(rhpsp_a.shape)>1):
+          rhpsp_a[0,rhpsp_a[0]<tiny]=tiny
+          rhpspa = rhpsp_a[0]
+        else:
+          rhpsp_a[rhpsp_a<tiny]=tiny
+          rhpspa = rhpsp_a
 
-      # TEST: To understand how these weights work, let's just use the exact exchange!
-      #exsl = exfull 
-      #excsl = exfull 
+        NA = NA+numpy.dot(rhoa,weight)
+        NB = NB+numpy.dot(rhob,weight)
+        rho = (rho_a, rho_b)
+ 
+        # LH terms 
+        #aos2 = m.eval_gto("GTOval_sph",coords)
+        #exfull=numpy.einsum('ri,sij,rj->r',aos2,R,aos2)
+        #expf=numpy.einsum('ri,sij,rj->r',aos2,RF,aos2)
+        exfull=make_exfa(0, aosex, mask, exctype)+make_exfb(0,aosex,mask,exctype)
+        expf=make_expfa(0, aosex, mask, exctype)+make_expfb(0,aosex,mask,exctype)
+        #print('!!!',exfull.shape)
+        exfull[exfull<tiny]=tiny
+        exfull=-0.5*exfull
+        expf[expf<tiny]=tiny
+        expf=-0.5*expf
 
-      # LH XC 
-      #exslf = exsl
-      #if(hyb>0.000001):
-      #  exslf = exsl/(1-hyb)
-      #z=(exslf/exfull)-1
-      #z[z<tiny]=tiny
-      #ahflh=erf(lam*z) 
-      #ahflh=numpy.zeros_like(excsl) # TEST turn off local hybrid bit 
-      #excsl = ahflh*exfull + (1-ahflh)*excsl
-      #print('??',numpy.dot(weight,excsl))
+        # SL XC 
+        x=xc
+        x=(x.split(','))[0] + ','
+        excsl=numpy.zeros_like(rhoa)
+        exsl=numpy.zeros_like(rhoa)
+        ecsl=numpy.zeros_like(rhoa)
+        if(xc!='hf'):
+          excsl, vxc = ni.eval_xc_eff(xc, rho, deriv=1, xctype=xctype)[:2]
+          if(x=='lda,' or x=='LDA,'):
+            exsl = ni.eval_xc_eff(x, (rhoa,rhob), deriv=0, xctype=xctype)[0]
+          else:
+            if(not(x=='hf,' or x=='HF,')):
+              print('LOOK WE ARE EVALUATING EXCHANGE |%s|'%(x))
+              exsl, vxc = ni.eval_xc_eff(x, rho, deriv=1, xctype=xctype)[:2]
+          excsl = excsl*(rhoa+rhob) 
+          exsl = exsl*(rhoa+rhob) 
+          ecsl=excsl-exsl
+        print('??',numpy.dot(weight,excsl),numpy.dot(weight,exsl))
+
+        # TEST: To understand how these weights work, let's just use the exact exchange!
+        #exsl = exfull 
+        #excsl = exfull 
+
+        # LH XC 
+        #exslf = exsl
+        #if(hyb>0.000001):
+        #  exslf = exsl/(1-hyb)
+        #z=(exslf/exfull)-1
+        #z[z<tiny]=tiny
+        #ahflh=erf(lam*z) 
+        #ahflh=numpy.zeros_like(excsl) # TEST turn off local hybrid bit 
+        #excsl = ahflh*exfull + (1-ahflh)*excsl
+        #print('??',numpy.dot(weight,excsl))
         
-      EXCSL = EXCSL+numpy.dot(excsl,weight) 
+        EXCSL = EXCSL+numpy.dot(excsl,weight) 
 
-      # Projected densities and XCs 
-      ngrids = coords.shape[0]
-      for ip in range(len(PPs)):
-        make_rhpa = make_rhpas[ip]
-        make_rhpb = make_rhpbs[ip]
-        rhp_a = make_rhpa(0, aos, mask, xctype)
-        rhp_b = make_rhpb(0, aos, mask, xctype)
-        if(len(rhp_b.shape)>0):
-          rhp_b[0,rhp_b[0]<tiny]=tiny
-          rhpb=rhp_b[0]
-        else:
-          rhp_b[rhp_b<tiny]=tiny
-          rhpb=rhp_b
-        if(len(rhp_a.shape)>0):
-          rhp_a[0,rhp_a[0]<tiny]=tiny
-          rhpa=rhp_a[0]
-        else:
-          rhp_a[rhp_a<tiny]=tiny
-          rhpa=rhp_a
-        make_rhppsppa = make_rhppsppas[ip]
-        make_rhppsppb = make_rhppsppbs[ip]
-        rhppspp_a = make_rhppsppa(0, aos, mask, xctype)
-        rhppspp_b = make_rhppsppb(0, aos, mask, xctype)
-        if(len(rhppspp_b.shape)>0):
-          rhppspp_b[0,rhppspp_b[0]<tiny]=tiny
-          rhppsppb=rhppspp_b[0]
-        else:
-          rhppspp_b[rhppspp_b<tiny]=tiny
-          rhppsppb=rhppspp_b
-        if(len(rhppspp_a.shape)>0):
-          rhppspp_a[0,rhppspp_a[0]<tiny]=tiny
-          rhppsppa=rhppspp_a[0]
-        else:
-          rhppspp_a[rhppspp_a<tiny]=tiny
-          rhppsppa=rhppspp_a
-        NPSPA = NPSPA+numpy.dot(rhppsppa,weight)
-        NPSPB = NPSPB+numpy.dot(rhppsppb,weight)
-        make_expa = make_expas[ip]
-        make_expb = make_expbs[ip]
-        expr=make_expa(0, aosex, mask, exctype)+make_expb(0,aosex,mask,exctype)
+        # Projected densities and XCs 
+        ngrids = coords.shape[0]
+        for ip in range(len(PPs)):
+          make_rhpa = make_rhpas[ip]
+          make_rhpb = make_rhpbs[ip]
+          rhp_a = make_rhpa(0, aos, mask, xctype)
+          rhp_b = make_rhpb(0, aos, mask, xctype)
+          if(len(rhp_b.shape)>0):
+            rhp_b[0,rhp_b[0]<tiny]=tiny
+            rhpb=rhp_b[0]
+          else:
+            rhp_b[rhp_b<tiny]=tiny
+            rhpb=rhp_b
+          if(len(rhp_a.shape)>0):
+            rhp_a[0,rhp_a[0]<tiny]=tiny
+            rhpa=rhp_a[0]
+          else:
+            rhp_a[rhp_a<tiny]=tiny
+            rhpa=rhp_a
+          make_rhppsppa = make_rhppsppas[ip]
+          make_rhppsppb = make_rhppsppbs[ip]
+          rhppspp_a = make_rhppsppa(0, aos, mask, xctype)
+          rhppspp_b = make_rhppsppb(0, aos, mask, xctype)
+          if(len(rhppspp_b.shape)>0):
+            rhppspp_b[0,rhppspp_b[0]<tiny]=tiny
+            rhppsppb=rhppspp_b[0]
+          else:
+            rhppspp_b[rhppspp_b<tiny]=tiny
+            rhppsppb=rhppspp_b
+          if(len(rhppspp_a.shape)>0):
+            rhppspp_a[0,rhppspp_a[0]<tiny]=tiny
+            rhppsppa=rhppspp_a[0]
+          else:
+            rhppspp_a[rhppspp_a<tiny]=tiny
+            rhppsppa=rhppspp_a
+          NPSPA = NPSPA+numpy.dot(rhppsppa,weight)
+          NPSPB = NPSPB+numpy.dot(rhppsppb,weight)
+          make_expa = make_expas[ip]
+          make_expb = make_expbs[ip]
+          expr=make_expa(0, aosex, mask, exctype)+make_expb(0,aosex,mask,exctype)
+          
+          expr[expr<tiny]=tiny
+          expr = -0.5*expr 
+          pwt = expr/exfull
+          pwt2 = ((rhpa+rhpb)/(rhoa+rhob+tiny))**2
+          pwt3 = ((rhppsppa+rhppsppb)/(rhpspa+rhpspb+tiny))
+          # If we do this rescaling, we CANNOT have the right answer when EXC= exact exchange!  
+          #pwt[pwt>1]=1
+          #pwt[pwt<0]=0
+          #for icoord in range(ngrids):
+          #  print('FAXS %2d  %12.6f %12.6f %12.6f %7.3e %7.3e %7.3e %7.3e %7.3e %7.3e  '%(ip,coords[icoord,0],coords[icoord,1],coords[icoord,2],pwt[icoord],pwt2[icoord],pwt3[icoord],rhoa[icoord],rhpa[icoord],rhppsppa[icoord]))
         
-        expr[expr<tiny]=tiny
-        expr = -0.5*expr 
-        pwt = expr/exfull
-        pwt2 = ((rhpa+rhpb)/(rhoa+rhob+tiny))**2
-        pwt3 = ((rhppsppa+rhppsppb)/(rhpspa+rhpspb+tiny))
-        # If we do this rescaling, we CANNOT have the right answer when EXC= exact exchange!  
-        #pwt[pwt>1]=1
-        #pwt[pwt<0]=0
-        for icoord in range(ngrids):
-          print('FAXS %2d  %12.6f %12.6f %12.6f %7.3e %7.3e %7.3e %7.3e %7.3e %7.3e  '%(ip,coords[icoord,0],coords[icoord,1],coords[icoord,2],pwt[icoord],pwt2[icoord],pwt3[icoord],rhoa[icoord],rhpa[icoord],rhppsppa[icoord]))
-        
-        pwt = pwt3
-        print('!!!',ip,numpy.dot(rhoa,weight),numpy.dot(rhpspa,weight),numpy.dot(rhpa,weight),numpy.dot(rhppsppa,weight),numpy.dot(rhoa*pwt,weight),numpy.dot(exfull,weight),numpy.dot(expr,weight))
-        excsls[ip]=excsls[ip]+ numpy.dot(excsl*pwt,weight)
+          pwt = pwt3
+          print('!!!',ip,numpy.dot(rhoa,weight),numpy.dot(rhpspa,weight),numpy.dot(rhpa,weight),numpy.dot(rhppsppa,weight),numpy.dot(rhoa*pwt,weight),numpy.dot(exfull,weight),numpy.dot(expr,weight))
+          excsls[ip]=excsls[ip]+ numpy.dot(excsl*pwt,weight)
 
   print('Numint Test NA,NB ',NA,NB)
   print('Numint Test NPSPA,NPSPB ',NPSPA,NPSPB)
@@ -2640,12 +2796,15 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
   # |<psivs|phi>|, regardless of whether this includes extremely high-energy
   # virtual orbitals. In this variant, we'll test other choices
 
-  # October 27 2025, given that this works so well, add the option for 
-  # CI on pairs of projection functions using the optimized MOs from single
-  # projection functions. november move to CI on SETS of projection functions
-  # to enable e.g. CAS(6,6) on individual N atoms in N100 
+  # October 27 2025, funcsets offers CI on multiple projection functions using the
+  # optimized MOs from single projection functions. Enables e.g. CAS(12,12) on
+  # pairs of N atoms in N100. 
+
+  # March 2026, return the projections Q from both sets for subsequent use 
 
   # Set up 
+  Q1s=[]
+  Q2s=[]
   pAOs = ks.paos 
   m = ks.mol
   (Na,Nb)=m.nelec
@@ -2683,33 +2842,6 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
   (Na,Nb)=m.nelec
   print('NUMTEST ',numpy.einsum('sij,ij->s',P,S))
 
-  # Virtual orbital energies for regularized perturbation theory 
-  mp2lam = ks.mp2lam
-  if(mp2lam is None):
-    mp2lam = 0.0000001
-  evap = numpy.zeros_like(e_a[Na:])
-  evbp = numpy.zeros_like(e_b[Nb:])
-  for i in range(len(evap)):
-    evap[i] = e_a[Na+i]
-    if(evap[i]-e_a[Na-1] <mp2lam):
-      evap[i] = e_a[Na-1]+mp2lam
-  for i in range(len(evbp)):
-    evbp[i] = e_b[Nb+i]
-    if(evbp[i]-e_b[Nb-1] <mp2lam):
-      evbp[i] = e_b[Nb-1]+mp2lam
-  #efa=(e_a[Na-1]+e_a[Na])/2 # Use Fermi levels to generate diagonal 
-  #efb=(e_b[Nb-1]+e_b[Nb])/2
-  efa=0
-  efb=0
-  evaps= numpy.diag(evap-efa)
-  evbps= numpy.diag(evbp-efb)
-  emos=numpy.zeros((2,nao))
-  emos[0,:Na]=e_a[:Na]
-  emos[0,Na:]=evap
-  emos[1,:Nb]=e_b[:Nb]
-  emos[1,Nb:]=evbp
-  print('Prepping euci5 mp2 with mp2lam ',mp2lam,' mo_energies\n',emos)
-
   # Generate the orthogonalized projected AOs with which to build the projected
   # atomic natural orbitals. This part could be done just once, not in every
   # SCF cycle. 
@@ -2743,9 +2875,8 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
 
   exs=numpy.zeros(ntot)
   ecs=numpy.zeros(ntot)
-  cvals=numpy.zeros((ntot,2))
+  #cvals=numpy.zeros((ntot,2))
   eovvals=numpy.zeros((ntot,4))
-  eovvals2=numpy.zeros((ntot,4)) # shifted orbital energies for regularized mp2 
   ecps=numpy.zeros(ntot)
   wts=numpy.zeros(ntot)
   # Save the projections Q and the optimized projected MOs entering the CI 
@@ -2805,14 +2936,13 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
        etavb = numpy.einsum('m,ma->a',v2,mo_b[:,Nb:])
        print('euci5 proj test ',noa,nob,numpy.dot(etaoa,etaoa),numpy.dot(etaob,etaob))
 
-
        # Here we initialize the four unitary transform matrices moa,mob...
        # and build the matrices used in their updates 
        # eoas(i,j) = eorb(i) delta(i,j)
-       eoas= numpy.diag(e_a[:Na]-efa)
-       eobs= numpy.diag(e_b[:Nb]-efb)
-       evas= numpy.diag(e_a[Na:]-efa)
-       evbs= numpy.diag(e_b[Nb:]-efb)
+       eoas= numpy.diag(e_a[:Na])
+       eobs= numpy.diag(e_b[:Nb])
+       evas= numpy.diag(e_a[Na:])
+       evbs= numpy.diag(e_b[Nb:])
        # etaoas(i,j) is <psi_i|phi><phi|psi_j> 
        etaoas = numpy.einsum('i,j->ij',etaoa,etaoa)
        etaobs = numpy.einsum('i,j->ij',etaob,etaob)
@@ -2828,27 +2958,19 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
        EcP=0
 
        if(Na>0 and Nb>0 and noa>0.001 and nob>0.001 and noa<0.999 and nob<0.999):
-         for itr in range(10):
+       #if(True): # Use all so that we can do the other stuf 
+         for itr in range(5):
 
            # Diagonalize the Fock-like matrices in the MO basis and choose the
            # new eigenvectors
            (va,ve) = linalg.eigh(moa)
            doa = ve[:,numpy.argmin(va)]
-           #print('Moa:\n',moa)
-           #print('moas: ',numpy.argmin(va),numpy.dot(doa,doa),va)
-           #print('doa: ',doa)
            (va,ve) = linalg.eigh(mob)
            dob = ve[:,numpy.argmin(va)]
-           #print('mobs: ',numpy.argmin(va),numpy.dot(dob,dob),va)
-           #print('dob: ',dob)
            (va,ve) = linalg.eigh(mva)
            dva = ve[:,numpy.argmin(va)]
-           #print('mvas: ',numpy.argmin(va),numpy.dot(dva,dva),va)
            (va,ve) = linalg.eigh(mvb)
            dvb = ve[:,numpy.argmin(va)]
-           #print('mvbs: ',numpy.argmin(va),numpy.dot(dvb,dvb),va)
-           #print('dva: ',dva)
-           #print('dvb: ',dvb)
 
            # Build the energy and the new Fock-like matrices 
            noa=numpy.dot(doa,etaoa)**2
@@ -2860,11 +2982,8 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
            eva = numpy.dot(dva,numpy.dot(evas,dva))
            evb = numpy.dot(dvb,numpy.dot(evbs,dvb))
            eovvals[itot,:]=[eoa,eob,eva,evb]
-           eva2 = numpy.dot(dva,numpy.dot(evaps,dva))
-           evb2 = numpy.dot(dvb,numpy.dot(evbps,dvb))
-           eovvals2[itot,:]=[eoa,eob,eva2,evb2]
            print('Proj N and J: ',iproj,noa,nob,nva,nvb,J)
-           print('Proj Occ and Virt: ',eoa,eob,eva,evb,eva2,evb2)
+           print('Proj Occ and Virt: ',eoa,eob,eva,evb)
            o = noa*nob*nva*nvb
            Del = (eva+evb-eoa-eob)/2 
            print('O and Del: ',o,Del)
@@ -2885,18 +3004,17 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
            mva =  Eco*noa*nob   *nvb* etavas + EcDel*evas/2
            mvb =  Eco*noa*nob*nva   * etavbs + EcDel*evbs/2
 
-           # Perturbation theory bit 
-           evapthis = numpy.dot(dva,numpy.dot(evaps,dva))
-           evbpthis = numpy.dot(dvb,numpy.dot(evbps,dvb))
-           EcP = -2*J**2*o/(evapthis+evbpthis-eoa-eob)
+           # Restrained deominator perturbation theory 
+           tau= ks.mp2lam
+           if(tau is None):
+             tau = 2.39
+           Delta = max(tau,eva+evb-eoa-eob)
+           Fac = 1/Delta
+           EcP = -2*J**2*o*Fac
            print('+++ %2d %12.6f %12.6f %12.6f %8.4f %8.4f %8.4f %8.4f '%(itr,Ec,EcP,Del,noa,nob,nva,nvb))
            
-         ecs[itot]=Ec
-         cvals[itot,:]=[c0val,c1val]
-         ecps[itot]=EcP
-         kepts[itot] = 1 
-         Js[itot] = J
-         phis[itot,:] = v3
+         # Do these things only if we did CI on this state
+         #cvals[itot,:]=[c0val,c1val]
          oas[itot,:] = numpy.einsum('mi,i->m',mo_a[:,:Na],doa) #<chi_mu|psi_oa> = <chi_mu|psi_i><psi_i|psi_oa>
          vas[itot,:] = numpy.einsum('mi,i->m',mo_a[:,Na:],dva)
          obs[itot,:] = numpy.einsum('mi,i->m',mo_b[:,:Nb],dob)
@@ -2905,78 +3023,22 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
          print('VAS TEST 1',numpy.dot(vas[itot],numpy.dot(S,vas[itot])))
          print('OAS TEST 2',numpy.dot(oas[itot],numpy.dot(S,mo_a[:,:Na])))
          print('VAS TEST 2',numpy.dot(vas[itot],numpy.dot(S,mo_a[:,Na:])))
-
-  # MP2 from correlated vs uncorrelated reference
-  ECPfv = 0 
-  ecps2=numpy.zeros(ntot)
-  if(hl>0 and False):
-
-    # build the <oo| and <vv| matrices which is expensive 
-    Vees2 = m.intor('int2e') 
-    for iproj in range(ntot):
-     if(kepts[iproj]>0):
-
-        # Project Vee onto |phi> for |o>,|v> space, use full Vee for remaining virtuals 
-        phi = phis[iproj]
-        Jtest = numpy.dot(phi,numpy.dot(phi,numpy.dot(phi,numpy.dot(phi,Vees2))))
-        print('J test ',Js[iproj],Jtest)
-        oas2 = numpy.dot(oas[iproj],numpy.dot(S,phi))*phi
-        obs2 = numpy.dot(obs[iproj],numpy.dot(S,phi))*phi
-        vas2 = numpy.dot(vas[iproj],numpy.dot(S,phi))*phi
-        vbs2 = numpy.dot(vbs[iproj],numpy.dot(S,phi))*phi
-        #Voo0=numpy.dot(obs[iproj],numpy.dot(oas[iproj],Vees2))
-        #Vvv0=numpy.dot(vbs[iproj],numpy.dot(vas[iproj],Vees2))
-        Voo0=numpy.dot(obs2,numpy.dot(oas2,Vees2))
-        Vvv0=numpy.dot(vbs2,numpy.dot(vas2,Vees2))
-
-        Voo = numpy.dot(numpy.transpose(mo_a[:,Na:]),numpy.dot(Voo0,mo_b[:,Nb:]))
-        Vvv = numpy.dot(numpy.transpose(mo_a[:,Na:]),numpy.dot(Vvv0,mo_b[:,Nb:]))
-        # Phase factor hack
-        if(Voo[0,0]<0 and Vvv[0,0]<0):
-          Voo = -Voo 
-        if(Voo[0,0]>0 and Vvv[0,0]>0):
-          Voo = -Voo 
-        #print('Full virtual MP2 shapes: ',Voo0.shape,Vvv0.shape,Voo.shape,Vvv.shape)
-
-	# Test that this matches the other one. It should NOT! This one uses
-	# the full Vee, the other one uses the projected Vee. <oo|Vee|vv> !=
-	# <oo|VPee|vv> 
-        #jmp2 = numpy.dot(obs2,numpy.dot(oas2,Vvv0))
-        #emp2 = -0.5*jmp2**2/(eovvals2[iproj,2]+eovvals2[iproj,3]-eovvals2[iproj,0]-eovvals2[iproj,1])
-        #print('EMP2 test: %3d %12.6f | %12.6f %12.6f '%(iproj,jmp2,ecps[iproj],emp2))
-  
-        # Assemble the correlation energies 
-        ecp0 = 0 
-        ecp1 = 0 
-        [c0,c1] = cvals[iproj,:]
-        eov0 =  eovvals[iproj,0]+eovvals[iproj,1]
-        eov1 =  eovvals[iproj,2]+eovvals[iproj,3] #Use unshifted orbital energies for regMP2 correction! 
-        #eov0 =  eovvals2[iproj,0]+eovvals2[iproj,1]
-        #eov1 =  eovvals2[iproj,2]+eovvals2[iproj,3]
-        #eov1 =  c0**2*eov0 + c1**2*(eovvals[iproj,2]+eovvals[iproj,3])  
-        #eov1 =  c0**2*eov0 + c1**2*(eovvals[iproj,2]+eovvals[iproj,3])  + ecs[iproj] # Use unshifted energies 
-        #eov1 =  eov0 # Correlation should be reduced in magnitude not increased 
-        print('Full virtual MP2 c0 c1 Voo Vvv ',c0,c1,Voo[0,0],Vvv[0,0],Voo0[0,0],Voo0[0,0])
-        print('Full virtual MP2 eovs evirt',eov0,eov1,evap[0],evap[1])
-        #print('Full virtual MP2 \n# a b ecp0 ecp1 ')
-        for a in range(nao-Na):
-          for b in range(nao-Nb):
-            den0 = evap[a]+evbp[b]-eov0
-            den1 = evap[a]+evbp[b]-eov1
-            ecp0t = -0.5*Voo[a,b]**2/den0
-            ecp1t = -0.5*Vvv[a,b]**2/den1 
-           # ecp1t = -0.5*((c0*Voo[a,b]+c1*Vvv[a,b])**2)/den1 # works but has some weird sign error 
-            #ecp1t = -0.5*(abs(c0*Voo[a,b])-abs(c1*Vvv[a,b])**2)/den1 # way too negative a correction 
-            #ecp1t = -0.5*(abs(c0*Voo[a,b])+abs(c1*Vvv[a,b])**2)/den1 
-            ecp0 = ecp0+ecp0t
-            ecp1 = ecp1+(c0**2*ecp0t-c1**2*ecp1t)
-            #print('%3d %3d %12.6f %12.6f '%(a,b,ecp0t,ecp1t))
-        print('Full virtual MP2 energies: ',ecp0,ecp1)
-        ecps2[iproj]=ecp1-ecp0
+         ecs[itot]=Ec
+         ecps[itot]=EcP
+       # Do these things even if there's no CI in this state 
+       kepts[itot] = 1 
+       Js[itot] = J
+       phis[itot,:] = v3
+       tehpao = numpy.transpose(numpy.array(phis[itot:itot+1,:]))
+       Q = pao_proj(ks,pAOs=[tehpao],doret=True)
+       Q1s.append(Q)
 
   # Correlation in sets of functions. (If not already set we'll use all pairs of functions) 
   EC2 = 0
   ECP2 = 0
+  wts2=[]
+  ecs2=[]
+  ecps2=[]
   if(hl>1 and sum(kepts)>0.00000001):
 
     # build the state overlaps to use in weights weights  [sum kl] <phi_i,phi_j|phi_k,phi_l> 
@@ -2997,9 +3059,6 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
            funcsets.append([iproj,jproj])
     print('funcsets \n',funcsets)
 
-    wts2=[]
-    ecs2=[]
-    ecps3=[]
     for iset in range(len(funcsets)):
       wt=1
       for jset in range(len(funcsets)): # overlap with all other sets 
@@ -3009,48 +3068,38 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
             for jproj in funcsets[jset]:
               val = val*(wts1[iproj,jproj])**2
           wt = wt + val
-      print('look the wt is ',wt)
+      print('look the 1/wt is ',wt)
       if(wt>1e-6):
         wt=1.0/wt
       else:
         wt=0
       tehpaos0=[]
-      #oas30=[]
-      #obs30=[]
-      #vas30=[]
-      #vbs30=[]
+      for iproj in funcsets[iset]:
+        if(kepts[iproj]>0):
+          tehpaos0.append(phis[iproj])
+      tehpaos = numpy.transpose(numpy.array(tehpaos0))
+      # TEST 
+      print('Overlap of paos in ',funcsets[iset])
+      Stest = numpy.dot(tehpaos.T,numpy.dot(S,tehpaos))
+      print(Stest)
+      Q = pao_proj(ks,pAOs=[tehpaos],doret=True)
+      Q2s.append(Q)
+      QS = numpy.dot(Q,S)
+      print('Multi-function CI ',funcsets[iset],' wt ',wt,' test ',numpy.einsum('ij->',numpy.dot(QS,Q)-Q))
       QMOoa = numpy.zeros((nao,nao))
       QMOob = numpy.zeros((nao,nao))
       QMOva = numpy.zeros((nao,nao))
       QMOvb = numpy.zeros((nao,nao))
       for iproj in funcsets[iset]:
         if(kepts[iproj]>0):
-          tehpaos0.append(phis[iproj])
-          QMOoa = QMOoa + numpy.einsum('m,n->mn',oas[iproj],oas[iproj])
-          QMOva = QMOva + numpy.einsum('m,n->mn',vas[iproj],vas[iproj])
-          QMOob = QMOob + numpy.einsum('m,n->mn',obs[iproj],obs[iproj])
-          QMOvb = QMOvb + numpy.einsum('m,n->mn',vbs[iproj],vbs[iproj])
-          #oas30.append(oas[iproj])
-          #obs30.append(obs[iproj])
-          #vas30.append(vas[iproj])
-          #vbs30.append(vbs[iproj])
-      tehpaos = numpy.transpose(numpy.array(tehpaos0))
-      Q = pao_proj(ks,pAOs=[tehpaos],doret=True)
-      #oas3 = numpy.transpose(numpy.array(oas30))
-      #obs3 = numpy.transpose(numpy.array(obs30))
-      #vas3 = numpy.transpose(numpy.array(vas30))
-      #vbs3 = numpy.transpose(numpy.array(vbs30))
-      #QMOoa = pao_proj(ks,pAOs=[oas3],doret=True)
-      #QMOob = pao_proj(ks,pAOs=[obs3],doret=True)
-      #QMOva = pao_proj(ks,pAOs=[vas3],doret=True)
-      #QMOvb = pao_proj(ks,pAOs=[vbs3],doret=True)
-      # If two projected MOs are nearly orthogonal, we should use 1 projected
-      # MO not 2 in the CI. 
-      QS = numpy.dot(Q,S)
-      print('Multi-function CI ',funcsets[iset],' wt ',wt,' test ',numpy.einsum('ij->',numpy.dot(QS,Q)-Q))
+          QMOoa = QMOoa + numpy.einsum('m,n->mn',oas[iproj],oas[iproj]) 
+          QMOva = QMOva + numpy.einsum('m,n->mn',vas[iproj],vas[iproj]) 
+          QMOob = QMOob + numpy.einsum('m,n->mn',obs[iproj],obs[iproj]) 
+          QMOvb = QMOvb + numpy.einsum('m,n->mn',vbs[iproj],vbs[iproj]) 
       QMOs = [QMOoa,QMOva,QMOob,QMOvb]
       print('Calling ECI from euci5 for multi-function CI with functions ',funcsets[iset])
-      ECij,dum,EMP2ij = eci(ks,QS=QS,QMOs=QMOs,Pin=Pin,hl=hl-2,emos=emos)
+      ECij,EMP2ij = eci(ks,QS=QS,QMOs=QMOs,Pin=Pin,hl=hl-2)
+      
       # Subtract off term 
       DECij= ECij 
       DEMP2ij= EMP2ij 
@@ -3059,17 +3108,18 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
           ww = 0 
           for jproj in funcsets[iset]:
              ww = ww+wts1[iproj,jproj]**2
-          print('Correcting with ',iproj,ecs[iproj],ww)
+          #print('Correcting with ',iproj,ecs[iproj],ww)
           DECij = DECij - ecs[iproj]/ww
           DEMP2ij = DEMP2ij - ecps[iproj]/ww
       print('Multi-function EC ',funcsets[iset],ECij,DECij,EMP2ij,DEMP2ij)
       wts2.append(wt)
       ecs2.append(DECij)
-      ecps3.append(DEMP2ij)
-    print('EUCI5 ECS2',ecs2)
+      ecps2.append(DEMP2ij)
+    print('EUCI5 multi-function corrections ECS2',ecs2)
+    print('EUCI5 multi-function corrections ECPS2',ecps2)
     print('WTS2   ',wts2)
     EC2 = numpy.dot(wts2,ecs2)
-    ECP2 = numpy.dot(wts2,ecps3)
+    ECP2 = numpy.dot(wts2,ecps2)
 
   print('EUCI5 EXS ',exs)
   print('EUCI5 ECS after',ecs)
@@ -3078,6 +3128,231 @@ def euci5(ks,Pin=None,hl=0,funcsets=None):
   EX = numpy.dot(exs  ,wts)
   EC = numpy.dot(ecs  ,wts)
   ECP = numpy.dot(ecps  ,wts)
-  ECPfv = numpy.dot(ecps2 ,wts)
-  print('EUCI5 EC(1), ECMP2(1), DEC(2), ECMP2fv(1)  ',EC,ECP,EC2,ECPfv,ECP2)
-  return (EC,ECP,EX,EC+EC2,ECPfv,ECP+ECP2)
+  print('EUCI5 EC(1), ECMP2(1), DEC(2), ECMP2(2) ',EC,ECP,EC2,ECP2)
+  return (EC,ECP,EX,EC+EC2,ECP+ECP2,[Q1s,Q2s],[wts,wts2])
+
+
+
+##### Utility function for Gaussian 
+names=['Dummy','H',          'He',
+'Li','Be',   'B','C','N','O','F','Ne',
+'Na','Mg',   'Al','Si','P','S','Cl','Ar',
+'K','Ca','Sc','Ti','V','Cr','Mn','Fe','Co','Ni','Cu','Zn','Ga','Ge','As','Se','Br','Kr']
+ 
+def readChk(file):
+
+  # Read header information 
+  NAO=0 
+  NMO=0 
+  Nat=0 
+  b=''
+  charge=0
+  spin=0
+  f = open(file,'r') 
+  lines = f.readlines()
+  b = lines[1].split().pop()
+  if(b=='Gen'):
+    b = 'def2svp'
+  for l in lines:
+    if('Number of atoms') in l:
+      Nat= int(l.split().pop())
+    if('Charge ') in l:
+      charge= int(l.split().pop())
+    if('Multiplicity ') in l:
+     spin= int(l.split().pop())-1 
+    if('Number of basis functions') in l:
+      NAO = int(l.split().pop())
+    if('Number of independent functions') in l:
+      NMO = int(l.split().pop())
+      break 
+  print('Your file has basis ',b,' with ',Nat,' atoms and ',NAO,' ',NMO,' basis functions')
+  print('Charge ',charge,' spin ',spin)
+  print('Basis ',b)
+
+  # Read lists of atom numbers and cartesin coordinates
+  iats=[]
+  cart=[]
+  N = 0 
+  r0= 0 
+  rs= 0 
+  for l in lines:
+    if(len(iats)>=Nat):
+      r0= 0 
+    if(len(cart)>=N):
+      rs= 0 
+    if(r0>0):
+      for x in l.split():
+       if(len(iats)<Nat):
+         iats.append(int(x))
+    if(rs>0):
+      for x in l.split():
+       if(len(cart)<N):
+         cart.append(float(x))
+    if('Atomic numbers' in l):
+      r0= 1 
+    if('Current cartesian coordinates' in l):
+      rs= 1 
+      N =int(l.split().pop())
+
+  # Repackage these into a PySCF molecule
+  geom=''
+  ind = -1 
+  for iat in range(Nat):
+    geom+= ' %4s ' %(names[iats[iat]])
+    for i in range(3):
+      ind = ind+1
+      geom+=' %12.6f ' %(cart[ind])
+    geom+='\n'
+
+  #print('Your geometry is:\n ',geom)
+  m = gto.Mole(atom=geom,charge=charge,spin=spin,basis=b)
+  m.unit='B' # Gaussian uses Bohr units for geometries 
+  #m.cart=True # Todo: Determine automatically 
+  m.build() 
+  NAO = m.nao 
+  labs=m.ao_labels()
+
+  # Read the basis functions in Gaussian order
+  # PySCF reorders them as 
+  # (1) atoms, (2) angular momentum, (3) shells, (4) spherical harmonics 
+  ipy=[]
+  for i in range(NAO):
+    ipy.append(i)
+  if(not m.cart):
+    for i in range(NAO):
+      if('dxy' in labs[i]): # Swap d subshells 
+        ipy[i  ] = i+2
+        ipy[i+1] = i+3
+        ipy[i+2] = i+1
+        ipy[i+3] = i+4
+        ipy[i+4] = i+0
+      if('f-3' in labs[i]): # Swap f subshells 
+        ipy[i  ] = i+3
+        ipy[i+1] = i+4
+        ipy[i+2] = i+2
+        ipy[i+3] = i+5
+        ipy[i+4] = i+1
+        ipy[i+5] = i+6
+        ipy[i+6] = i+0
+      if('g-4' in labs[i]): # Swap g subshells 
+        ipy[i  ] = i+4
+        ipy[i+1] = i+5
+        ipy[i+2] = i+3
+        ipy[i+3] = i+6
+        ipy[i+4] = i+2
+        ipy[i+5] = i+7
+        ipy[i+6] = i+1
+        ipy[i+7] = i+8
+        ipy[i+8] = i+0
+
+  # Read lists of total and spin density matrices 
+  pdm0 = [] 
+  pdms = [] 
+  N = 0 
+  r0= 0 
+  rs= 0 
+  for l in lines:
+    if(len(pdm0)>=N):
+      r0= 0 
+    if(len(pdms)>=N):
+      rs= 0 
+    if(r0>0):
+      for x in l.split():
+       if(len(pdm0)<N):
+         pdm0.append(float(x))
+    if(rs>0):
+      for x in l.split():
+       if(len(pdms)<N):
+         pdms.append(float(x))
+    if('Total SCF Density' in l):
+      r0= 1 
+      N =int(l.split().pop())
+    if('Spin SCF Density' in l):
+      rs= 1 
+  #print('You read in total 1PDM \n',pdm0,'\n and spin 1PDM\n',pdms)
+
+  # Repackage these into a PySCF density matrix 
+  P=numpy.zeros((2,NAO,NAO))
+  ind = -1 
+  for i in range(NAO):
+    for j in range(i+1):
+      ind = ind + 1 
+      sp = 0 
+      if(len(pdms)>0):
+        sp = pdms[ind]
+      v0 =  (pdm0[ind]+sp)/2
+      v1 =  (pdm0[ind]-sp)/2
+      P[0,ipy[i],ipy[j]] = v0
+      P[0,ipy[j],ipy[i]] = v0
+      P[1,ipy[i],ipy[j]] = v1
+      P[1,ipy[j],ipy[i]] = v1
+
+  # Read lists of alpha and beta orbital coefficients
+  coefa= [] 
+  coefb= [] 
+  N = 0 
+  ra= 0 
+  rb= 0 
+  for l in lines:
+    if(len(coefa)>=N):
+      ra= 0 
+    if(len(coefb)>=N):
+      rb= 0 
+    if(ra>0):
+      for x in l.split():
+       if(len(coefa)<N):
+         coefa.append(float(x))
+    if(rb>0):
+      for x in l.split():
+       if(len(coefb)<N):
+         coefb.append(float(x))
+    if('Alpha MO coefficie' in l):
+      ra= 1 
+      N =int(l.split().pop())
+    if('Beta MO coefficie' in l):
+      rb= 1 
+      N =int(l.split().pop())
+
+  # Repackage these into a PySCF MO coefficient list [spin,ao,mo] 
+  print('Coef len: ',len(coefa),len(coefb))
+  mo_coeff=numpy.zeros((2,NAO,NMO))
+  ind = -1 
+  for imo in range(NMO):
+    for iao in range(NAO):
+      ind = ind + 1 
+      v0 = coefa[ind]
+      v1 = v0
+      if(len(coefb)>0):
+        v1 = coefb[ind]
+      mo_coeff[0,ipy[iao],imo] = v0
+      mo_coeff[1,ipy[iao],imo] = v1
+
+  # Read lists of orbital energies
+  aorb = [] 
+  borb = [] 
+  N = 0 
+  ra= 0 
+  rb= 0 
+  for l in lines:
+    if(len(aorb)>=N):
+      ra= 0 
+    if(len(borb)>=N):
+      rb= 0 
+    if(ra>0):
+      for x in l.split():
+       if(len(aorb)<N):
+         aorb.append(float(x))
+    if(rb>0):
+      for x in l.split():
+       if(len(borb)<N):
+         borb.append(float(x))
+    if('Alpha Orbital Energies' in l):
+      ra= 1 
+      N =int(l.split().pop())
+    if('Beta Orbital Energies' in l):
+      rb= 1 
+  if(len(borb)<1):
+    borb = aorb 
+  print('Orbital array lengths ',len(aorb),len(borb))
+  return(m,P,mo_coeff,aorb,borb)
+  
